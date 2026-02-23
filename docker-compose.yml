@@ -1,0 +1,16 @@
+services:
+  apcu-stats:
+    build:
+      context: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - .:/app
+
+  test:
+    build:
+      context: .
+    working_dir: /app
+    volumes:
+      - .:/app
+    command: ["bash", "tests/run-integration.sh"]

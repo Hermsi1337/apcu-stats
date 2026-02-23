@@ -125,14 +125,57 @@ function hasConfiguredEditCredentials(): bool
     return APCU_STATS_EDIT_USER !== '' && APCU_STATS_EDIT_PASS !== '';
 }
 
+function readBasicAuthCredentials(): array
+{
+    $user = (string) ($_SERVER['PHP_AUTH_USER'] ?? '');
+    $pass = (string) ($_SERVER['PHP_AUTH_PW'] ?? '');
+    if ($user !== '' || $pass !== '') {
+        return [$user, $pass];
+    }
+
+    $headers = [];
+    foreach (['HTTP_AUTHORIZATION', 'REDIRECT_HTTP_AUTHORIZATION', 'Authorization'] as $key) {
+        $value = $_SERVER[$key] ?? '';
+        if (is_string($value) && $value !== '') {
+            $headers[] = $value;
+        }
+    }
+
+    if (function_exists('apache_request_headers')) {
+        $requestHeaders = apache_request_headers();
+        if (is_array($requestHeaders)) {
+            foreach (['Authorization', 'authorization'] as $key) {
+                $value = $requestHeaders[$key] ?? '';
+                if (is_string($value) && $value !== '') {
+                    $headers[] = $value;
+                }
+            }
+        }
+    }
+
+    foreach ($headers as $header) {
+        if (stripos($header, 'Basic ') !== 0) {
+            continue;
+        }
+
+        $decoded = base64_decode(trim(substr($header, 6)), true);
+        if ($decoded === false || !str_contains($decoded, ':')) {
+            continue;
+        }
+
+        return explode(':', $decoded, 2);
+    }
+
+    return ['', ''];
+}
+
 function isEditAuthenticated(): bool
 {
     if (!hasConfiguredEditCredentials()) {
         return false;
     }
 
-    $actualUser = (string) ($_SERVER['PHP_AUTH_USER'] ?? '');
-    $actualPass = (string) ($_SERVER['PHP_AUTH_PW'] ?? '');
+    [$actualUser, $actualPass] = readBasicAuthCredentials();
 
     return hash_equals(APCU_STATS_EDIT_USER, $actualUser)
         && hash_equals(APCU_STATS_EDIT_PASS, $actualPass);
@@ -201,6 +244,8 @@ $search = $canInspectEntries ? trim(getString('q', '')) : '';
 $sort = $canInspectEntries ? getString('sort', 'hits') : 'hits';
 $dir = ($canInspectEntries && strtolower(getString('dir', 'desc')) === 'asc') ? 'asc' : 'desc';
 $limit = $canInspectEntries ? getInt('limit', 200, 10, 1000) : 200;
+$autoRefreshSeconds = getInt('refresh', 0, 0, 300);
+$authLink = '?auth=1' . ($autoRefreshSeconds > 0 ? '&refresh=' . $autoRefreshSeconds : '');
 
 $cacheInfo = null;
 $smaInfo = null;
@@ -227,6 +272,7 @@ $availableMemory = 0;
 $usedMemory = 0;
 $usagePercent = 0.0;
 $fragmentation = 0.0;
+$apcuRecentlyStarted = false;
 $phpVersion = PHP_VERSION;
 $apcuVersion = phpversion('apcu') ?: 'unknown';
 
@@ -253,6 +299,7 @@ if ($apcuAvailable) {
     $requests = $hits + $misses;
     $hitRate = $requests > 0 ? ($hits / $requests) * 100 : 0;
     $uptime = $startTime > 0 ? max(0, $now - $startTime) : 0;
+    $apcuRecentlyStarted = $startTime > 0 && $uptime < 120;
     $requestRate = $uptime > 0 ? $requests / $uptime : 0;
     $hitRatePerSecond = $uptime > 0 ? $hits / $uptime : 0;
     $missRatePerSecond = $uptime > 0 ? $misses / $uptime : 0;
@@ -404,6 +451,7 @@ $csrf = csrfToken();
         .metric { background: #f8fafc; border: 1px solid #e5edf5; border-radius: 8px; padding: 10px; }
         .metric .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
         .metric .value { font-size: 20px; font-weight: 700; margin-top: 4px; }
+        .metric .hint { margin-top: 6px; color: var(--muted); font-size: 11px; line-height: 1.3; }
         .progress {
             height: 9px; border-radius: 999px; background: #ecf2f9; overflow: hidden; margin-top: 8px;
         }
@@ -436,6 +484,9 @@ $csrf = csrfToken();
         button.danger { background: var(--danger); }
         button:disabled { opacity: .55; cursor: not-allowed; }
         .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+        .toolbar form { display: flex; gap: 8px; align-items: center; margin: 0; }
+        .toolbar label { margin-bottom: 0; font-size: 12px; }
+        .toolbar select { width: auto; min-width: 120px; }
         .alert {
             border-radius: 8px;
             padding: 9px 12px;
@@ -548,12 +599,65 @@ $csrf = csrfToken();
                     <div class="label">PHP / APCu</div>
                     <div class="value"><?= esc($phpVersion) ?> / <?= esc($apcuVersion) ?></div>
                 </div>
+                <div class="metric">
+                    <div class="label">Scope</div>
+                    <div class="value">Per worker</div>
+                    <div class="hint">APCu stats apply to the current PHP worker process.</div>
+                </div>
+                <div class="metric">
+                    <div class="label">Worker Status</div>
+                    <div class="value"><?= $apcuRecentlyStarted ? 'Recently started' : 'Active' ?></div>
+                    <div class="hint">On shared hosting, uptime and entries can jump if requests hit another worker.</div>
+                </div>
+            </div>
+            <div class="footnote">
+                APCu uptime is reported per PHP worker process.
+                On shared hosting with multiple workers or restarts, uptime and visible entries can jump between requests.
+                <?php if ($apcuRecentlyStarted): ?>
+                    Current worker started recently.
+                <?php endif; ?>
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="toolbar">
+                <form method="get">
+                    <?php if ($canInspectEntries): ?>
+                        <input type="hidden" name="q" value="<?= esc($search) ?>">
+                        <input type="hidden" name="sort" value="<?= esc($sort) ?>">
+                        <input type="hidden" name="dir" value="<?= esc($dir) ?>">
+                        <input type="hidden" name="limit" value="<?= esc($limit) ?>">
+                    <?php endif; ?>
+                    <label for="refresh">Auto refresh</label>
+                    <select id="refresh" name="refresh">
+                        <?php
+                        $refreshOptions = [
+                            0 => 'Off',
+                            5 => '5s',
+                            10 => '10s',
+                            30 => '30s',
+                            60 => '60s',
+                            120 => '2m',
+                            300 => '5m',
+                        ];
+                        foreach ($refreshOptions as $value => $label):
+                        ?>
+                            <option value="<?= esc($value) ?>" <?= $autoRefreshSeconds === $value ? 'selected' : '' ?>><?= esc($label) ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                    <button type="submit">Apply</button>
+                </form>
+                <button type="button" class="secondary" onclick="location.reload()">Refresh now</button>
+                <span class="footnote">
+                    <?= $autoRefreshSeconds > 0 ? esc(sprintf('Auto refresh every %ds.', $autoRefreshSeconds)) : 'Auto refresh is off.' ?>
+                </span>
             </div>
         </div>
 
         <?php if ($canInspectEntries): ?>
             <div class="panel">
                 <form method="get" class="controls">
+                    <input type="hidden" name="refresh" value="<?= esc($autoRefreshSeconds) ?>">
                     <div>
                         <label for="q">Search key</label>
                         <input id="q" type="text" name="q" value="<?= esc($search) ?>" placeholder="prefix:user:123">
@@ -598,7 +702,6 @@ $csrf = csrfToken();
                         <input type="hidden" name="action" value="clear">
                         <button type="submit" class="danger">Clear cache</button>
                     </form>
-                    <button type="button" class="secondary" onclick="location.reload()">Refresh</button>
                     <span class="footnote">Showing <?= esc(count($entries)) ?> of <?= esc($entryTotal) ?> matching entries.</span>
                 </div>
             </div>
@@ -659,12 +762,19 @@ $csrf = csrfToken();
                     <?php if (!$editCredentialsConfigured): ?>
                         Statistics-only mode is active. Set <code>APCU_STATS_EDIT_USER</code> and <code>APCU_STATS_EDIT_PASS</code> in this file to unlock entry browsing and write actions.
                     <?php else: ?>
-                        Statistics-only mode is active for unauthenticated requests. <a href="?auth=1">Authenticate now</a> to unlock entry browsing and write actions.
+                        Statistics-only mode is active for unauthenticated requests. <a href="<?= esc($authLink) ?>">Authenticate now</a> to unlock entry browsing and write actions.
                     <?php endif; ?>
                 </div>
             </div>
         <?php endif; ?>
     <?php endif; ?>
 </div>
+<?php if ($autoRefreshSeconds > 0): ?>
+<script>
+    setTimeout(function () {
+        window.location.reload();
+    }, <?= esc($autoRefreshSeconds * 1000) ?>);
+</script>
+<?php endif; ?>
 </body>
 </html>

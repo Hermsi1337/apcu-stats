@@ -36,6 +36,14 @@ Then open `http://127.0.0.1:8080/apcu-stats.php`.
 - By default (`APCU_STATS_EDIT_USER` / `APCU_STATS_EDIT_PASS` empty), dashboard runs in statistics-only mode.
 - In statistics-only mode, key browsing/search and all write actions are hidden or server-side blocked.
 - If credentials are configured, open `?auth=1` once to trigger HTTP Basic Auth in the browser, then entry browsing and write actions are unlocked.
+- On some shared hosting (CGI/FastCGI), PHP does not receive Basic Auth variables automatically.
+  In that case, add this to `.htaccess` in the same directory:
+
+```apache
+RewriteEngine On
+RewriteCond %{HTTP:Authorization} ^(.*)
+RewriteRule ^ - [E=HTTP_AUTHORIZATION:%1]
+```
 
 ## URL Parameters
 
@@ -44,6 +52,7 @@ Then open `http://127.0.0.1:8080/apcu-stats.php`.
 - `sort`: `hits|size|ttl|created|access|key`
 - `dir`: `asc|desc`
 - `limit`: number of rows (`10-1000`)
+- `refresh`: auto refresh interval in seconds (`0|5|10|30|60|120|300`)
 
 Example:
 
@@ -57,6 +66,15 @@ Example:
 - `Clear cache`: clears complete user cache
 - both actions are protected by CSRF token
 - without configured and authenticated edit credentials, entry browsing and write actions are locked
+
+## Notes
+
+- The dashboard includes two dedicated info tiles in the stats grid:
+  - `Scope`: shows that APCu metrics are per worker process
+  - `Worker Status`: indicates whether the current worker started recently
+- APCu `uptime` and visible entries are per PHP worker process, not global for all workers.
+- On shared hosting, requests may hit different workers or restarted workers, so uptime can jump/reset and entry lists can differ between reloads.
+- If cache fills up, APCu can evict entries automatically (`expunges` increases); this is expected behavior.
 
 ## Docker
 

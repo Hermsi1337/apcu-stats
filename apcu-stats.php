@@ -1,6 +1,13 @@
 <?php
 declare(strict_types=1);
 
+/**
+ * Edit credentials for destructive actions (delete / clear cache).
+ * Leave both values empty to force statistics-only mode.
+ */
+const APCU_STATS_EDIT_USER = '';
+const APCU_STATS_EDIT_PASS = '';
+
 if (PHP_SAPI === 'cli') {
     fwrite(STDERR, "This script is meant to run through a web server.\n");
     exit(1);
@@ -113,69 +120,87 @@ function isApcuAvailable(): bool
     return true;
 }
 
-function mustAuthFromEnv(): bool
+function hasConfiguredEditCredentials(): bool
 {
-    return getenv('APCU_STATS_USER') !== false || getenv('APCU_STATS_PASS') !== false;
+    return APCU_STATS_EDIT_USER !== '' && APCU_STATS_EDIT_PASS !== '';
 }
 
-function requireBasicAuth(): void
+function isEditAuthenticated(): bool
 {
-    if (!mustAuthFromEnv()) {
-        return;
+    if (!hasConfiguredEditCredentials()) {
+        return false;
     }
 
-    $expectedUser = (string) getenv('APCU_STATS_USER');
-    $expectedPass = (string) getenv('APCU_STATS_PASS');
     $actualUser = (string) ($_SERVER['PHP_AUTH_USER'] ?? '');
     $actualPass = (string) ($_SERVER['PHP_AUTH_PW'] ?? '');
 
-    if (hash_equals($expectedUser, $actualUser) && hash_equals($expectedPass, $actualPass)) {
-        return;
-    }
+    return hash_equals(APCU_STATS_EDIT_USER, $actualUser)
+        && hash_equals(APCU_STATS_EDIT_PASS, $actualPass);
+}
 
-    header('WWW-Authenticate: Basic realm="APCu Stats"');
+function requestEditAuth(): void
+{
+    header('WWW-Authenticate: Basic realm="APCu Stats Edit Access"');
     http_response_code(401);
     echo "Authentication required.\n";
     exit(0);
 }
 
-requireBasicAuth();
-
 $messages = [];
 $now = time();
 $apcuAvailable = isApcuAvailable();
+$editCredentialsConfigured = hasConfiguredEditCredentials();
+$editAuthenticated = isEditAuthenticated();
+$canEdit = $editCredentialsConfigured && $editAuthenticated;
+$canInspectEntries = $canEdit;
+
+if ($editCredentialsConfigured && getString('auth') === '1' && !$editAuthenticated) {
+    requestEditAuth();
+}
 
 if ($apcuAvailable && ($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
-    $submittedToken = postString('csrf_token');
-    if (!hash_equals(csrfToken(), $submittedToken)) {
-        $messages[] = ['type' => 'error', 'text' => 'Invalid CSRF token.'];
+    $action = postString('action');
+    $writeActions = ['clear', 'delete'];
+    $isWriteAction = in_array($action, $writeActions, true);
+
+    if ($isWriteAction && !$editCredentialsConfigured) {
+        $messages[] = [
+            'type' => 'error',
+            'text' => 'Statistics-only mode is active. Set APCU_STATS_EDIT_USER and APCU_STATS_EDIT_PASS in this file to enable write actions.',
+        ];
+    } elseif ($isWriteAction && !$editAuthenticated) {
+        requestEditAuth();
     } else {
-        $action = postString('action');
-        if ($action === 'clear') {
-            $ok = apcu_clear_cache();
-            $messages[] = [
-                'type' => $ok ? 'success' : 'error',
-                'text' => $ok ? 'APCu cache cleared.' : 'Unable to clear APCu cache.',
-            ];
-        } elseif ($action === 'delete') {
-            $key = postString('key');
-            if ($key === '') {
-                $messages[] = ['type' => 'error', 'text' => 'Missing key.'];
-            } else {
-                $ok = apcu_delete($key);
+        $submittedToken = postString('csrf_token');
+        if (!hash_equals(csrfToken(), $submittedToken)) {
+            $messages[] = ['type' => 'error', 'text' => 'Invalid CSRF token.'];
+        } else {
+            if ($action === 'clear') {
+                $ok = apcu_clear_cache();
                 $messages[] = [
                     'type' => $ok ? 'success' : 'error',
-                    'text' => $ok ? sprintf('Deleted key "%s".', $key) : sprintf('Failed to delete key "%s".', $key),
+                    'text' => $ok ? 'APCu cache cleared.' : 'Unable to clear APCu cache.',
                 ];
+            } elseif ($action === 'delete') {
+                $key = postString('key');
+                if ($key === '') {
+                    $messages[] = ['type' => 'error', 'text' => 'Missing key.'];
+                } else {
+                    $ok = apcu_delete($key);
+                    $messages[] = [
+                        'type' => $ok ? 'success' : 'error',
+                        'text' => $ok ? sprintf('Deleted key "%s".', $key) : sprintf('Failed to delete key "%s".', $key),
+                    ];
+                }
             }
         }
     }
 }
 
-$search = trim(getString('q', ''));
-$sort = getString('sort', 'hits');
-$dir = strtolower(getString('dir', 'desc')) === 'asc' ? 'asc' : 'desc';
-$limit = getInt('limit', 200, 10, 1000);
+$search = $canInspectEntries ? trim(getString('q', '')) : '';
+$sort = $canInspectEntries ? getString('sort', 'hits') : 'hits';
+$dir = ($canInspectEntries && strtolower(getString('dir', 'desc')) === 'asc') ? 'asc' : 'desc';
+$limit = $canInspectEntries ? getInt('limit', 200, 10, 1000) : 200;
 
 $cacheInfo = null;
 $smaInfo = null;
@@ -266,65 +291,67 @@ if ($apcuAvailable) {
     }
     $fragmentation = $totalFree > 0 ? (1 - ($largestBlock / $totalFree)) * 100 : 0;
 
-    $cacheList = $cacheInfo['cache_list'] ?? [];
-    if (is_array($cacheList)) {
-        foreach ($cacheList as $entry) {
-            if (!is_array($entry)) {
-                continue;
+    if ($canInspectEntries) {
+        $cacheList = $cacheInfo['cache_list'] ?? [];
+        if (is_array($cacheList)) {
+            foreach ($cacheList as $entry) {
+                if (!is_array($entry)) {
+                    continue;
+                }
+
+                $key = (string) ($entry['info'] ?? $entry['key'] ?? '');
+                if ($key === '') {
+                    continue;
+                }
+
+                if ($search !== '' && stripos($key, $search) === false) {
+                    continue;
+                }
+
+                $creation = (int) ($entry['creation_time'] ?? $entry['ctime'] ?? 0);
+                $access = (int) ($entry['access_time'] ?? $entry['atime'] ?? 0);
+                $mtime = (int) ($entry['mtime'] ?? $access);
+                $ttl = (int) ($entry['ttl'] ?? 0);
+                $expiresAt = ($ttl > 0 && $creation > 0) ? ($creation + $ttl) : 0;
+                $ttlLeft = $expiresAt > 0 ? max(0, $expiresAt - $now) : null;
+
+                $entries[] = [
+                    'key' => $key,
+                    'hits' => (int) ($entry['num_hits'] ?? $entry['nhits'] ?? 0),
+                    'size' => (int) ($entry['mem_size'] ?? $entry['size'] ?? 0),
+                    'ttl' => $ttl,
+                    'ttl_left' => $ttlLeft,
+                    'creation' => $creation,
+                    'mtime' => $mtime,
+                    'access' => $access,
+                ];
             }
-
-            $key = (string) ($entry['info'] ?? $entry['key'] ?? '');
-            if ($key === '') {
-                continue;
-            }
-
-            if ($search !== '' && stripos($key, $search) === false) {
-                continue;
-            }
-
-            $creation = (int) ($entry['creation_time'] ?? $entry['ctime'] ?? 0);
-            $access = (int) ($entry['access_time'] ?? $entry['atime'] ?? 0);
-            $mtime = (int) ($entry['mtime'] ?? $access);
-            $ttl = (int) ($entry['ttl'] ?? 0);
-            $expiresAt = ($ttl > 0 && $creation > 0) ? ($creation + $ttl) : 0;
-            $ttlLeft = $expiresAt > 0 ? max(0, $expiresAt - $now) : null;
-
-            $entries[] = [
-                'key' => $key,
-                'hits' => (int) ($entry['num_hits'] ?? $entry['nhits'] ?? 0),
-                'size' => (int) ($entry['mem_size'] ?? $entry['size'] ?? 0),
-                'ttl' => $ttl,
-                'ttl_left' => $ttlLeft,
-                'creation' => $creation,
-                'mtime' => $mtime,
-                'access' => $access,
-            ];
         }
-    }
 
-    $sorters = [
-        'key' => static fn(array $a, array $b): int => strcmp($a['key'], $b['key']),
-        'hits' => static fn(array $a, array $b): int => $a['hits'] <=> $b['hits'],
-        'size' => static fn(array $a, array $b): int => $a['size'] <=> $b['size'],
-        'ttl' => static fn(array $a, array $b): int => ($a['ttl_left'] ?? PHP_INT_MAX) <=> ($b['ttl_left'] ?? PHP_INT_MAX),
-        'created' => static fn(array $a, array $b): int => $a['creation'] <=> $b['creation'],
-        'access' => static fn(array $a, array $b): int => $a['access'] <=> $b['access'],
-    ];
+        $sorters = [
+            'key' => static fn(array $a, array $b): int => strcmp($a['key'], $b['key']),
+            'hits' => static fn(array $a, array $b): int => $a['hits'] <=> $b['hits'],
+            'size' => static fn(array $a, array $b): int => $a['size'] <=> $b['size'],
+            'ttl' => static fn(array $a, array $b): int => ($a['ttl_left'] ?? PHP_INT_MAX) <=> ($b['ttl_left'] ?? PHP_INT_MAX),
+            'created' => static fn(array $a, array $b): int => $a['creation'] <=> $b['creation'],
+            'access' => static fn(array $a, array $b): int => $a['access'] <=> $b['access'],
+        ];
 
-    $sorter = $sorters[$sort] ?? $sorters['hits'];
-    usort(
-        $entries,
-        static function (array $a, array $b) use ($sorter, $dir): int {
-            $result = $sorter($a, $b);
-            return $dir === 'asc' ? $result : -$result;
+        $sorter = $sorters[$sort] ?? $sorters['hits'];
+        usort(
+            $entries,
+            static function (array $a, array $b) use ($sorter, $dir): int {
+                $result = $sorter($a, $b);
+                return $dir === 'asc' ? $result : -$result;
+            }
+        );
+
+        $entryTotal = count($entries);
+        if ($numEntries === 0) {
+            $numEntries = $entryTotal;
         }
-    );
-
-    $entryTotal = count($entries);
-    if ($numEntries === 0) {
-        $numEntries = $entryTotal;
+        $entries = array_slice($entries, 0, $limit);
     }
-    $entries = array_slice($entries, 0, $limit);
 }
 
 $csrf = csrfToken();
@@ -407,6 +434,7 @@ $csrf = csrfToken();
         }
         button.secondary { background: #475569; }
         button.danger { background: var(--danger); }
+        button:disabled { opacity: .55; cursor: not-allowed; }
         .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
         .alert {
             border-radius: 8px;
@@ -439,7 +467,7 @@ $csrf = csrfToken();
 <div class="wrap">
     <h1>APCu Stats</h1>
     <div class="subtitle">
-        Live view of APCu cache usage and entries.
+        <?= $canInspectEntries ? 'Live view of APCu cache usage and entries.' : 'Live view of APCu cache statistics.' ?>
         <?php if ($startTime > 0): ?>
             Uptime: <?= esc(formatDuration($uptime)) ?>.
         <?php endif; ?>
@@ -523,109 +551,119 @@ $csrf = csrfToken();
             </div>
         </div>
 
-        <div class="panel">
-            <form method="get" class="controls">
-                <div>
-                    <label for="q">Search key</label>
-                    <input id="q" type="text" name="q" value="<?= esc($search) ?>" placeholder="prefix:user:123">
-                </div>
-                <div>
-                    <label for="sort">Sort</label>
-                    <select id="sort" name="sort">
-                        <?php
-                        $sortLabels = [
-                            'hits' => 'Hits',
-                            'size' => 'Size',
-                            'ttl' => 'TTL left',
-                            'created' => 'Created',
-                            'access' => 'Last access',
-                            'key' => 'Key',
-                        ];
-                        foreach ($sortLabels as $value => $label):
-                        ?>
-                            <option value="<?= esc($value) ?>" <?= $sort === $value ? 'selected' : '' ?>><?= esc($label) ?></option>
-                        <?php endforeach; ?>
-                    </select>
-                </div>
-                <div>
-                    <label for="dir">Direction</label>
-                    <select id="dir" name="dir">
-                        <option value="desc" <?= $dir === 'desc' ? 'selected' : '' ?>>Desc</option>
-                        <option value="asc" <?= $dir === 'asc' ? 'selected' : '' ?>>Asc</option>
-                    </select>
-                </div>
-                <div>
-                    <label for="limit">Limit</label>
-                    <input id="limit" type="number" name="limit" min="10" max="1000" value="<?= esc($limit) ?>">
-                </div>
-                <div>
-                    <button type="submit">Apply</button>
-                </div>
-            </form>
-
-            <div class="toolbar">
-                <form method="post" onsubmit="return confirm('Clear entire APCu cache?');">
-                    <input type="hidden" name="csrf_token" value="<?= esc($csrf) ?>">
-                    <input type="hidden" name="action" value="clear">
-                    <button type="submit" class="danger">Clear cache</button>
+        <?php if ($canInspectEntries): ?>
+            <div class="panel">
+                <form method="get" class="controls">
+                    <div>
+                        <label for="q">Search key</label>
+                        <input id="q" type="text" name="q" value="<?= esc($search) ?>" placeholder="prefix:user:123">
+                    </div>
+                    <div>
+                        <label for="sort">Sort</label>
+                        <select id="sort" name="sort">
+                            <?php
+                            $sortLabels = [
+                                'hits' => 'Hits',
+                                'size' => 'Size',
+                                'ttl' => 'TTL left',
+                                'created' => 'Created',
+                                'access' => 'Last access',
+                                'key' => 'Key',
+                            ];
+                            foreach ($sortLabels as $value => $label):
+                            ?>
+                                <option value="<?= esc($value) ?>" <?= $sort === $value ? 'selected' : '' ?>><?= esc($label) ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <div>
+                        <label for="dir">Direction</label>
+                        <select id="dir" name="dir">
+                            <option value="desc" <?= $dir === 'desc' ? 'selected' : '' ?>>Desc</option>
+                            <option value="asc" <?= $dir === 'asc' ? 'selected' : '' ?>>Asc</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label for="limit">Limit</label>
+                        <input id="limit" type="number" name="limit" min="10" max="1000" value="<?= esc($limit) ?>">
+                    </div>
+                    <div>
+                        <button type="submit">Apply</button>
+                    </div>
                 </form>
-                <button type="button" class="secondary" onclick="location.reload()">Refresh</button>
-                <span class="footnote">Showing <?= esc(count($entries)) ?> of <?= esc($entryTotal) ?> matching entries.</span>
-            </div>
-        </div>
 
-        <div class="panel">
-            <table>
-                <thead>
-                <tr>
-                    <th>Key</th>
-                    <th>Size</th>
-                    <th>Hits</th>
-                    <th>TTL left</th>
-                    <th>Created</th>
-                    <th>Last access</th>
-                    <th>Action</th>
-                </tr>
-                </thead>
-                <tbody>
-                <?php if ($entries === []): ?>
-                    <tr><td class="empty" colspan="7">No entries found.</td></tr>
-                <?php else: ?>
-                    <?php foreach ($entries as $entry): ?>
-                        <tr>
-                            <td class="key" title="<?= esc($entry['key']) ?>"><?= esc($entry['key']) ?></td>
-                            <td><?= esc(formatBytes($entry['size'])) ?></td>
-                            <td><?= esc(number_format($entry['hits'])) ?></td>
-                            <td>
-                                <?php
-                                if ($entry['ttl_left'] === null) {
-                                    echo 'never';
-                                } elseif ($entry['ttl_left'] === 0) {
-                                    echo '<span style="color:' . esc('#d97706') . '">expired</span>';
-                                } else {
-                                    echo esc(formatDuration((int) $entry['ttl_left']));
-                                }
-                                ?>
-                            </td>
-                            <td><?= $entry['creation'] > 0 ? esc(date('Y-m-d H:i:s', (int) $entry['creation'])) : '-' ?></td>
-                            <td><?= $entry['access'] > 0 ? esc(date('Y-m-d H:i:s', (int) $entry['access'])) : '-' ?></td>
-                            <td>
-                                <form method="post" onsubmit="return confirm('Delete this key?');">
-                                    <input type="hidden" name="csrf_token" value="<?= esc($csrf) ?>">
-                                    <input type="hidden" name="action" value="delete">
-                                    <input type="hidden" name="key" value="<?= esc($entry['key']) ?>">
-                                    <button type="submit">Delete</button>
-                                </form>
-                            </td>
-                        </tr>
-                    <?php endforeach; ?>
-                <?php endif; ?>
-                </tbody>
-            </table>
-            <div class="footnote">
-                Optional basic auth: set `APCU_STATS_USER` and `APCU_STATS_PASS` in your web server environment.
+                <div class="toolbar">
+                    <form method="post" onsubmit="return confirm('Clear entire APCu cache?');">
+                        <input type="hidden" name="csrf_token" value="<?= esc($csrf) ?>">
+                        <input type="hidden" name="action" value="clear">
+                        <button type="submit" class="danger">Clear cache</button>
+                    </form>
+                    <button type="button" class="secondary" onclick="location.reload()">Refresh</button>
+                    <span class="footnote">Showing <?= esc(count($entries)) ?> of <?= esc($entryTotal) ?> matching entries.</span>
+                </div>
             </div>
-        </div>
+
+            <div class="panel">
+                <table>
+                    <thead>
+                    <tr>
+                        <th>Key</th>
+                        <th>Size</th>
+                        <th>Hits</th>
+                        <th>TTL left</th>
+                        <th>Created</th>
+                        <th>Last access</th>
+                        <th>Action</th>
+                    </tr>
+                    </thead>
+                    <tbody>
+                    <?php if ($entries === []): ?>
+                        <tr><td class="empty" colspan="7">No entries found.</td></tr>
+                    <?php else: ?>
+                        <?php foreach ($entries as $entry): ?>
+                            <tr>
+                                <td class="key" title="<?= esc($entry['key']) ?>"><?= esc($entry['key']) ?></td>
+                                <td><?= esc(formatBytes($entry['size'])) ?></td>
+                                <td><?= esc(number_format($entry['hits'])) ?></td>
+                                <td>
+                                    <?php
+                                    if ($entry['ttl_left'] === null) {
+                                        echo 'never';
+                                    } elseif ($entry['ttl_left'] === 0) {
+                                        echo '<span style="color:' . esc('#d97706') . '">expired</span>';
+                                    } else {
+                                        echo esc(formatDuration((int) $entry['ttl_left']));
+                                    }
+                                    ?>
+                                </td>
+                                <td><?= $entry['creation'] > 0 ? esc(date('Y-m-d H:i:s', (int) $entry['creation'])) : '-' ?></td>
+                                <td><?= $entry['access'] > 0 ? esc(date('Y-m-d H:i:s', (int) $entry['access'])) : '-' ?></td>
+                                <td>
+                                    <form method="post" onsubmit="return confirm('Delete this key?');">
+                                        <input type="hidden" name="csrf_token" value="<?= esc($csrf) ?>">
+                                        <input type="hidden" name="action" value="delete">
+                                        <input type="hidden" name="key" value="<?= esc($entry['key']) ?>">
+                                        <button type="submit">Delete</button>
+                                    </form>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                    <?php endif; ?>
+                    </tbody>
+                </table>
+                <div class="footnote">Entry browser and write actions are enabled for the authenticated edit account.</div>
+            </div>
+        <?php else: ?>
+            <div class="panel">
+                <div class="footnote">
+                    <?php if (!$editCredentialsConfigured): ?>
+                        Statistics-only mode is active. Set <code>APCU_STATS_EDIT_USER</code> and <code>APCU_STATS_EDIT_PASS</code> in this file to unlock entry browsing and write actions.
+                    <?php else: ?>
+                        Statistics-only mode is active for unauthenticated requests. <a href="?auth=1">Authenticate now</a> to unlock entry browsing and write actions.
+                    <?php endif; ?>
+                </div>
+            </div>
+        <?php endif; ?>
     <?php endif; ?>
 </div>
 </body>

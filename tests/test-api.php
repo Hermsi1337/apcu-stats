@@ -43,5 +43,17 @@ if ($action === 'seed') {
     exit;
 }
 
+if ($action === 'exists') {
+    $key = (string) ($_GET['key'] ?? '');
+    if ($key === '') {
+        http_response_code(400);
+        echo json_encode(['ok' => false, 'error' => 'missing key']);
+        exit;
+    }
+
+    echo json_encode(['ok' => true, 'exists' => apcu_exists($key)]);
+    exit;
+}
+
 http_response_code(400);
 echo json_encode(['ok' => false, 'error' => 'unknown action']);

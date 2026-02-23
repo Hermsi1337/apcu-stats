@@ -6,9 +6,6 @@ services:
       - "8080:8080"
     volumes:
       - .:/app
-    environment:
-      APCU_STATS_USER: ${APCU_STATS_USER:-admin}
-      APCU_STATS_PASS: ${APCU_STATS_PASS:-change-me}
 
   test:
     build:

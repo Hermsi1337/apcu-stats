@@ -11,8 +11,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Build test image
+        run: docker compose build --pull test
+
       - name: Verify PHP 8.5 in test container
-        run: docker compose run --rm test php -v | grep -E '^PHP 8\\.5\\.'
+        run: |
+          docker compose run --rm -T test php -r '
+            echo PHP_VERSION, PHP_EOL;
+            if (PHP_MAJOR_VERSION !== 8 || PHP_MINOR_VERSION !== 5) {
+              fwrite(STDERR, "Expected PHP 8.5.\n");
+              exit(1);
+            }
+          '
 
       - name: Run integration tests
-        run: docker compose run --rm test
+        run: docker compose run --rm -T test

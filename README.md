@@ -11,7 +11,7 @@ Single-file APCu dashboard for modern PHP versions.
 
 ## Requirements
 
-- PHP 8.1+ (tested with PHP 8.3)
+- PHP 8.1+ (tested with PHP 8.5)
 - APCu extension enabled (`apc.enabled=1`)
 - for CLI server/testing: `apc.enable_cli=1`
 

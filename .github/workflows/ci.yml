@@ -11,5 +11,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Verify PHP 8.5 in test container
+        run: docker compose run --rm test php -v | grep -E '^PHP 8\\.5\\.'
+
       - name: Run integration tests
         run: docker compose run --rm test
